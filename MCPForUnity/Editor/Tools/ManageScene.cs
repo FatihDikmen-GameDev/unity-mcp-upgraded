@@ -589,6 +589,47 @@ namespace MCPForUnity.Editor.Tools
                     }
                 }
 
+                // No camera was specified and we have an editor (not batch): grab the GameView window pixels
+                // directly. This is the only path that includes Screen Space - Overlay canvases in edit mode —
+                // an offscreen Camera render skips them. Works in both edit and play modes.
+                if (targetCamera == null && !Application.isBatchMode)
+                {
+                    try
+                    {
+                        var gvResult = EditorWindowScreenshotUtility.CaptureGameViewViewportToAssets(
+                            fileName, resolvedSuperSize, ensureUniqueFileName: true,
+                            includeImage: includeImage, maxResolution: maxResolution,
+                            out int gvW, out int gvH);
+
+                        AssetDatabase.ImportAsset(gvResult.AssetsRelativePath, ImportAssetOptions.ForceSynchronousImport);
+
+                        var data = new Dictionary<string, object>
+                        {
+                            { "path", gvResult.AssetsRelativePath },
+                            { "fullPath", gvResult.FullPath },
+                            { "superSize", gvResult.SuperSize },
+                            { "isAsync", false },
+                            { "captureSource", "game_view" },
+                            { "viewportWidth", gvW },
+                            { "viewportHeight", gvH },
+                        };
+                        if (includeImage && gvResult.ImageBase64 != null)
+                        {
+                            data["imageBase64"] = gvResult.ImageBase64;
+                            data["imageWidth"] = gvResult.ImageWidth;
+                            data["imageHeight"] = gvResult.ImageHeight;
+                        }
+                        return new SuccessResponse(
+                            $"Screenshot captured to '{gvResult.AssetsRelativePath}' (game view, {gvW}x{gvH}).",
+                            data);
+                    }
+                    catch (Exception gvEx)
+                    {
+                        McpLog.Warn($"[ManageScene] Game View capture failed, falling back to camera render: {gvEx.Message}");
+                        // Fall through to the camera-render / ScreenCapture API path below.
+                    }
+                }
+
                 // When a specific camera is requested or include_image is true, always use camera-based capture
                 // (synchronous, gives us bytes in memory for base64).
                 if (targetCamera != null || includeImage)

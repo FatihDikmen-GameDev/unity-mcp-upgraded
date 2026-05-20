@@ -27,6 +27,156 @@ namespace MCPForUnity.Editor.Helpers
             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
         };
 
+        private static Type s_gameViewType;
+        private static Type GameViewType
+        {
+            get
+            {
+                if (s_gameViewType == null)
+                    s_gameViewType = Type.GetType("UnityEditor.GameView, UnityEditor");
+                return s_gameViewType;
+            }
+        }
+
+        /// <summary>
+        /// Captures the active Game View viewport (including Screen Space - Overlay canvases) to a PNG asset.
+        /// Mirrors <see cref="CaptureSceneViewViewportToAssets"/>: grabs pixels directly from the editor window's
+        /// hostView instead of re-rendering a Camera offscreen, so overlay UI composites into the result.
+        /// </summary>
+        public static ScreenshotCaptureResult CaptureGameViewViewportToAssets(
+            string fileName,
+            int superSize,
+            bool ensureUniqueFileName,
+            bool includeImage,
+            int maxResolution,
+            out int viewportWidth,
+            out int viewportHeight)
+        {
+            Type gameViewType = GameViewType;
+            if (gameViewType == null)
+                throw new InvalidOperationException("UnityEditor.GameView type not found.");
+
+            var gameView = EditorWindow.GetWindow(gameViewType, false, "Game", true);
+            if (gameView == null)
+                throw new InvalidOperationException("Failed to open a Game View window.");
+
+            int effectiveSuperSize = NormalizeSceneViewSuperSize(superSize);
+
+            FocusAndRepaintWindow(gameView);
+
+            object hostView = GetHostView(gameView);
+            if (hostView == null)
+                throw new InvalidOperationException("Failed to resolve Game view host view.");
+
+            Rect viewportRectPixels = GetGameViewViewportPixelRect(gameView, gameViewType, hostView);
+            viewportWidth = Mathf.RoundToInt(viewportRectPixels.width);
+            viewportHeight = Mathf.RoundToInt(viewportRectPixels.height);
+
+            if (viewportWidth <= 0 || viewportHeight <= 0)
+                throw new InvalidOperationException("Captured Game view viewport is empty.");
+
+            Texture2D captured = null;
+            Texture2D downscaled = null;
+            try
+            {
+                captured = CaptureViewRect(gameView, viewportRectPixels);
+
+                var result = PrepareCaptureResult(fileName, effectiveSuperSize, ensureUniqueFileName);
+                byte[] png = captured.EncodeToPNG();
+                File.WriteAllBytes(result.FullPath, png);
+
+                if (includeImage)
+                {
+                    int targetMax = maxResolution > 0 ? maxResolution : 640;
+                    string imageBase64;
+                    int imageWidth;
+                    int imageHeight;
+
+                    if (captured.width > targetMax || captured.height > targetMax)
+                    {
+                        downscaled = ScreenshotUtility.DownscaleTexture(captured, targetMax);
+                        imageBase64 = Convert.ToBase64String(downscaled.EncodeToPNG());
+                        imageWidth = downscaled.width;
+                        imageHeight = downscaled.height;
+                    }
+                    else
+                    {
+                        imageBase64 = Convert.ToBase64String(png);
+                        imageWidth = captured.width;
+                        imageHeight = captured.height;
+                    }
+
+                    return new ScreenshotCaptureResult(
+                        result.FullPath,
+                        result.AssetsRelativePath,
+                        result.SuperSize,
+                        false,
+                        imageBase64,
+                        imageWidth,
+                        imageHeight);
+                }
+
+                return result;
+            }
+            finally
+            {
+                DestroyTexture(captured);
+                DestroyTexture(downscaled);
+            }
+        }
+
+        private static Rect GetGameViewViewportPixelRect(EditorWindow gameView, Type gameViewType, object hostView)
+        {
+            // GrabPixels operates in host-view local coords with Y increasing UPWARD from the bottom.
+            // `viewInParent` is the game-content rect below tabs and GameView toolbar in top-down host coords.
+            // `targetInView` is the actual rendered rect inside that (letterboxed when aspect ratios differ).
+            // Combined → top-down position of the game render. Convert Y to bottom-up using host height.
+            Rect? viewInParent = GetRectProperty(gameView, "viewInParent");
+            Rect? targetInView = GetRectProperty(gameView, "targetInView");
+
+            if (!viewInParent.HasValue || !targetInView.HasValue ||
+                targetInView.Value.width <= 0f || targetInView.Value.height <= 0f)
+            {
+                throw new InvalidOperationException(
+                    "Failed to resolve Game view viewport rect. The Game View may not be initialized.");
+            }
+
+            float topDownX = viewInParent.Value.x + targetInView.Value.x;
+            float topDownY = viewInParent.Value.y + targetInView.Value.y;
+            float widthPts = targetInView.Value.width;
+            float heightPts = targetInView.Value.height;
+
+            Rect? hostPos = GetRectProperty(hostView, "position");
+            float hostHeightPts = hostPos.HasValue ? hostPos.Value.height : gameView.position.height + 21f;
+            float bottomUpY = hostHeightPts - topDownY - heightPts;
+
+            float pixelsPerPoint = EditorGUIUtility.pixelsPerPoint;
+            return new Rect(
+                Mathf.Round(topDownX * pixelsPerPoint),
+                Mathf.Round(bottomUpY * pixelsPerPoint),
+                Mathf.Round(widthPts * pixelsPerPoint),
+                Mathf.Round(heightPts * pixelsPerPoint));
+        }
+
+        private static void FocusAndRepaintWindow(EditorWindow window)
+        {
+            try { window.Focus(); }
+            catch (Exception ex) { McpLog.Debug($"[EditorWindowScreenshotUtility] Focus failed: {ex.Message}"); }
+
+            try
+            {
+                window.Repaint();
+                InvokeMethodIfExists(window, "RepaintImmediately");
+                UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
+                EditorApplication.QueuePlayerLoopUpdate();
+                Thread.Sleep(RepaintSettlingDelayMs);
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug($"[EditorWindowScreenshotUtility] Repaint failed: {ex.Message}");
+            }
+        }
+
         /// <summary>
         /// Captures the active Scene View viewport to a PNG asset.
         /// </summary>
@@ -177,11 +327,11 @@ namespace MCPForUnity.Editor.Helpers
                 Mathf.Min(windowRect.height, viewportHeight));
         }
 
-        private static Texture2D CaptureViewRect(SceneView sceneView, Rect viewportRectPixels)
+        private static Texture2D CaptureViewRect(EditorWindow window, Rect viewportRectPixels)
         {
-            object hostView = GetHostView(sceneView);
+            object hostView = GetHostView(window);
             if (hostView == null)
-                throw new InvalidOperationException("Failed to resolve Scene view host view.");
+                throw new InvalidOperationException("Failed to resolve editor window host view.");
 
             // GrabPixels is an internal extern on GUIView (parent of HostView), present since at least Unity 2021.1.
             // See: UnityCsReference/Editor/Mono/GUIView.bindings.cs — `internal extern void GrabPixels(RenderTexture, Rect)`
