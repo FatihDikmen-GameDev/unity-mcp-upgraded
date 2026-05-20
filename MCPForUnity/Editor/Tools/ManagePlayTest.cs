@@ -611,7 +611,7 @@ namespace MCPForUnity.Editor.Tools
         }
 
         // Fallback: search every GameObject (including inactive) for an exact name match.
-        var all = Resources.FindObjectsOfTypeAll<GameObject>();
+        var all = UnityEngine.Resources.FindObjectsOfTypeAll<GameObject>();
         return all.FirstOrDefault(g =>
             g.name == pathOrName &&
             g.hideFlags == HideFlags.None &&
