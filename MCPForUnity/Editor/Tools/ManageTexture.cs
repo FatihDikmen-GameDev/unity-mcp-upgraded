@@ -1067,7 +1067,20 @@ namespace MCPForUnity.Editor.Tools
                 importerSettings.spriteExtrude = (uint)extrudeToken.ToObject<int>();
                 settingsChanged = true;
             }
-            
+
+            // Sprite Border (9-slice): [left, bottom, right, top]
+            var borderToken = settings["spriteBorder"];
+            if (borderToken is JArray borderArray && borderArray.Count >= 4)
+            {
+                importerSettings.spriteBorder = new Vector4(
+                    borderArray[0].ToObject<float>(),
+                    borderArray[1].ToObject<float>(),
+                    borderArray[2].ToObject<float>(),
+                    borderArray[3].ToObject<float>()
+                );
+                settingsChanged = true;
+            }
+
             if (settingsChanged)
             {
                 importer.SetTextureSettings(importerSettings);

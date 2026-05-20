@@ -124,6 +124,51 @@ class TestManageTextureIntegration:
         assert settings["filterMode"] == "Point"
         assert settings["wrapMode"] == "Clamp"
 
+    def test_create_sprite_with_border(self, monkeypatch):
+        """sprite_border in import_settings is forwarded as camelCase spriteBorder."""
+        captured = {}
+
+        async def fake_send(func, instance, cmd, params, **kwargs):
+            captured["params"] = params
+            return {"success": True, "message": "Created sprite"}
+
+        monkeypatch.setattr(manage_texture_mod, "send_with_unity_instance", fake_send)
+        monkeypatch.setattr(manage_texture_mod, "preflight", noop_preflight)
+
+        resp = run_async(manage_texture_mod.manage_texture(
+            ctx=DummyContext(),
+            action="create_sprite",
+            path="Assets/TestTextures/Bordered.png",
+            fill_color=[255, 255, 255, 255],
+            import_settings={
+                "texture_type": "sprite",
+                "sprite_border": [4, 4, 4, 4],
+            }
+        ))
+
+        assert resp["success"] is True
+        settings = captured["params"]["importSettings"]
+        assert settings["textureType"] == "Sprite"
+        assert settings["spriteBorder"] == [4.0, 4.0, 4.0, 4.0]
+
+    def test_sprite_border_invalid_length(self, monkeypatch):
+        """sprite_border with fewer than 4 entries returns a clear error."""
+        async def fake_send(*args, **kwargs):
+            return {"success": True}
+
+        monkeypatch.setattr(manage_texture_mod, "send_with_unity_instance", fake_send)
+        monkeypatch.setattr(manage_texture_mod, "preflight", noop_preflight)
+
+        resp = run_async(manage_texture_mod.manage_texture(
+            ctx=DummyContext(),
+            action="set_import_settings",
+            path="Assets/TestTextures/Bordered.png",
+            import_settings={"sprite_border": [4, 4, 4]}
+        ))
+
+        assert resp["success"] is False
+        assert "sprite_border" in resp["message"]
+
     def test_texture_modify_params(self, monkeypatch):
         """Test texture modify parameter conversion."""
         captured = {}

@@ -370,6 +370,15 @@ def _normalize_import_settings(value: Any) -> tuple[dict | None, str | None]:
                 return None, f"sprite_extrude must be 0-32, got {extrude}"
             result["spriteExtrude"] = extrude
 
+    if "sprite_border" in value:
+        border = value["sprite_border"]
+        if not isinstance(border, (list, tuple)) or len(border) != 4:
+            return None, f"sprite_border must be [left, bottom, right, top], got {border}"
+        try:
+            result["spriteBorder"] = [float(border[0]), float(border[1]), float(border[2]), float(border[3])]
+        except (TypeError, ValueError):
+            return None, f"sprite_border values must be numbers, got {border}"
+
     return result, None
 
 
@@ -459,7 +468,8 @@ async def manage_texture(
         "filter_mode (point/bilinear/trilinear), aniso_level (0-16), max_texture_size (32-16384), "
         "compression (none/low_quality/normal_quality/high_quality), compression_quality (0-100), "
         "sprite_mode (single/multiple/polygon), sprite_pixels_per_unit, sprite_pivot, "
-        "sprite_mesh_type (full_rect/tight), sprite_extrude (0-32)"] | None = None,
+        "sprite_mesh_type (full_rect/tight), sprite_extrude (0-32), "
+        "sprite_border ([left, bottom, right, top] in pixels — 9-slice borders)"] | None = None,
 
 ) -> dict[str, Any]:
     unity_instance = await get_unity_instance_from_context(ctx)
