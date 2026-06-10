@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import logging
+import os
 import time
 from hashlib import sha256
 from typing import Optional
@@ -27,6 +28,21 @@ logger = logging.getLogger("mcp-for-unity-server")
 
 _DEFAULT_POLL_INTERVAL = 1.0
 _MAX_POLL_SECONDS = 600
+_DEFINITION_GRACE_DEFAULT_SECONDS = 8.0
+_DEFINITION_GRACE_POLL_SECONDS = 0.25
+
+
+def _read_definition_grace_seconds() -> float:
+    raw = os.environ.get("UNITY_MCP_TOOL_DEFINITION_WAIT_SECONDS",
+                         str(_DEFINITION_GRACE_DEFAULT_SECONDS))
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid UNITY_MCP_TOOL_DEFINITION_WAIT_SECONDS=%r, using default %.1f",
+            raw, _DEFINITION_GRACE_DEFAULT_SECONDS)
+        value = _DEFINITION_GRACE_DEFAULT_SECONDS
+    return max(0.0, min(value, 30.0))
 
 
 async def get_user_id_from_context(ctx: Context) -> str | None:
@@ -140,6 +156,9 @@ class CustomToolService:
 
         definition = await self.get_tool_definition(project_id, tool_name, user_id=user_id)
         if definition is None:
+            definition = await self._wait_for_tool_definition(
+                project_id, tool_name, user_id=user_id)
+        if definition is None:
             return MCPResponse(
                 success=False,
                 message=f"Tool '{tool_name}' not found for project {project_id}",
@@ -171,6 +190,43 @@ class CustomToolService:
         return result
 
     # --- Internal helpers ------------------------------------------------
+    async def _wait_for_tool_definition(
+        self,
+        project_id: str,
+        tool_name: str,
+        user_id: str | None = None,
+    ) -> ToolDefinitionModel | None:
+        """Grace period for the domain-reload window.
+
+        A Unity domain reload (entering play mode, recompiling) drops the
+        plugin session along with its registered tools; Unity re-sends
+        ``register_tools`` a few seconds after reconnecting (it is deferred
+        via ``EditorApplication.delayCall``). In that window every definition
+        lookup returns None even though the tool exists, so poll briefly
+        instead of hard-failing. Bail out early once the project's
+        registration is present (non-empty tool list) but the requested name
+        is not in it — that is a genuine miss, not a reload gap.
+        """
+        max_wait_s = _read_definition_grace_seconds()
+        if max_wait_s <= 0:
+            return None
+
+        deadline = time.monotonic() + max_wait_s
+        while time.monotonic() < deadline:
+            definition = await self.get_tool_definition(project_id, tool_name, user_id=user_id)
+            if definition is not None:
+                logger.info(
+                    "Tool '%s' for project '%s' became available during the reload grace wait",
+                    tool_name, project_id)
+                return definition
+
+            registered = await self.list_registered_tools(project_id, user_id=user_id)
+            if registered:
+                return None
+
+            await asyncio.sleep(_DEFINITION_GRACE_POLL_SECONDS)
+        return None
+
     def _is_registered(self, project_id: str, tool_name: str) -> bool:
         return tool_name in self._project_tools.get(project_id, {})
 
