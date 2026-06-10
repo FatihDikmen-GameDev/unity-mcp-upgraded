@@ -10,9 +10,11 @@ using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.EventSystems;
+#if MCP_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.Controls;
 using UnityEngine.InputSystem.LowLevel;
+#endif
 using UnityEngine.UI;
 using Debug = UnityEngine.Debug;
 
@@ -45,7 +47,7 @@ namespace MCPForUnity.Editor.Tools
                         return ClickUI(@params["path"]?.ToString() ?? @params["target"]?.ToString());
                     case "drag_ui":
                         return DragUI(
-                            @params["from"]?.ToString(),
+                            @params["from"]?.ToString() ?? @params["path"]?.ToString() ?? @params["target"]?.ToString(),
                             @params["to"]?.ToString(),
                             @params["steps"]?.ToObject<int>() ?? 10,
                             @params["step_delay_ms"]?.ToObject<int>() ?? 16);
@@ -537,6 +539,7 @@ namespace MCPForUnity.Editor.Tools
     /// </summary>
     public static object PressChord(string[] keys, int holdMs = 50)
     {
+#if MCP_INPUT_SYSTEM
         if (keys == null || keys.Length == 0) return Err("keys is required.");
         var controls = new List<KeyControl>();
         foreach (var k in keys)
@@ -549,10 +552,14 @@ namespace MCPForUnity.Editor.Tools
         Thread.Sleep(Mathf.Clamp(holdMs, 0, 5000));
         foreach (var kc in controls) WriteKey(kc, 0f);
         return new { success = true, chord = string.Join("+", keys), heldMs = holdMs };
+#else
+        return Err("PressChord requires the Input System package (com.unity.inputsystem).");
+#endif
     }
 
     // ---------- internals ----------
 
+#if MCP_INPUT_SYSTEM
     private static bool TryGetKeyControl(string keyName, out KeyControl keyControl, out string error)
     {
         keyControl = null;
@@ -598,6 +605,18 @@ namespace MCPForUnity.Editor.Tools
             InputSystem.Update();
         }
     }
+#else
+    // Input System package not installed: PressKey/ReleaseKey/TapKey fall back to the OS SendInput
+    // path alone; these stubs keep the dual-path call sites compiling.
+    private static bool TryGetKeyControl(string keyName, out object keyControl, out string error)
+    {
+        keyControl = null;
+        error = "Input System package (com.unity.inputsystem) is not installed.";
+        return false;
+    }
+
+    private static void WriteKey(object control, float value) { }
+#endif
 
     private static GameObject FindByPath(string pathOrName)
     {
