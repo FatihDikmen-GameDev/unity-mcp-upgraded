@@ -605,7 +605,23 @@ namespace MCPForUnity.Editor.Tools.ProBuilder
 
         private static Component CreateShapeViaGenerator(string shapeType, JObject props, object pivot)
         {
-            float size = props["size"]?.Value<float>() ?? 0;
+            // 'size' may be a scalar (uniform) or an array [x,y,z]; tolerate both so an
+            // array value no longer throws "Cannot cast JArray to JToken".
+            float size = 0;
+            Vector3 sizeVec = Vector3.zero;
+            var sizeToken = props["size"];
+            if (sizeToken != null)
+            {
+                if (sizeToken.Type == JTokenType.Array)
+                {
+                    sizeVec = ParseVector3(sizeToken);
+                }
+                else
+                {
+                    size = sizeToken.Value<float>();
+                    sizeVec = new Vector3(size, size, size);
+                }
+            }
             float width = props["width"]?.Value<float>() ?? 0;
             float height = props["height"]?.Value<float>() ?? 0;
             float depth = props["depth"]?.Value<float>() ?? 0;
@@ -615,9 +631,9 @@ namespace MCPForUnity.Editor.Tools.ProBuilder
             {
                 case "CUBE":
                 {
-                    float w = width > 0 ? width : (size > 0 ? size : 1f);
-                    float h = height > 0 ? height : (size > 0 ? size : 1f);
-                    float d = depth > 0 ? depth : (size > 0 ? size : 1f);
+                    float w = width > 0 ? width : (sizeVec.x > 0 ? sizeVec.x : 1f);
+                    float h = height > 0 ? height : (sizeVec.y > 0 ? sizeVec.y : 1f);
+                    float d = depth > 0 ? depth : (sizeVec.z > 0 ? sizeVec.z : 1f);
                     return InvokeGenerator("GenerateCube",
                         new[] { _pivotLocationType, typeof(Vector3) },
                         new object[] { pivot, new Vector3(w, h, d) });
@@ -625,9 +641,9 @@ namespace MCPForUnity.Editor.Tools.ProBuilder
 
                 case "PRISM":
                 {
-                    float w = width > 0 ? width : (size > 0 ? size : 1f);
-                    float h = height > 0 ? height : (size > 0 ? size : 1f);
-                    float d = depth > 0 ? depth : (size > 0 ? size : 1f);
+                    float w = width > 0 ? width : (sizeVec.x > 0 ? sizeVec.x : 1f);
+                    float h = height > 0 ? height : (sizeVec.y > 0 ? sizeVec.y : 1f);
+                    float d = depth > 0 ? depth : (sizeVec.z > 0 ? sizeVec.z : 1f);
                     return InvokeGenerator("GeneratePrism",
                         new[] { _pivotLocationType, typeof(Vector3) },
                         new object[] { pivot, new Vector3(w, h, d) });
