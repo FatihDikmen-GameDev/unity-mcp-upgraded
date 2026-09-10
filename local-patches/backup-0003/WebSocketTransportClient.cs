@@ -45,12 +45,6 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private CancellationTokenSource _connectionCts;
         private Task _receiveTask;
         private Task _keepAliveTask;
-        // Local patch 0003: the reconnect worker MUST be tracked. It used to be fire-and-forget
-        // (`_ = Task.Run(AttemptReconnectAsync)`), so ForceStop never waited for it and nothing
-        // stopped it from RESURRECTING the socket mid-teardown — with a flapping server (frequent
-        // reconnect cycles) nearly every domain reload then entered the freeze with a live untracked
-        // task, which is the 100%-CPU "Reload Script Assemblies" wedge the 0001/0002 patches missed.
-        private Task _reconnectTask;
         private readonly SemaphoreSlim _sendLock = new(1, 1);
 
         private Uri _endpointUri;
@@ -124,11 +118,6 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             await StopAsync();
 
-            // Local patch 0003: a deliberate (re)start is the ONE place the teardown latch lifts.
-            // ForceStop leaves it set when a worker missed its exit cap; by here StopAsync has
-            // awaited the old loops for real, so a fresh lifecycle is safe.
-            _shuttingDown = false;
-
             _lifecycleCts = new CancellationTokenSource();
             _endpointUri = BuildWebSocketUri(HttpEndpointUtility.GetBaseUrl());
             _sessionId = null;
@@ -180,12 +169,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _isConnected = false;
             _state = TransportState.Disconnected(TransportDisplayName);
 
-            // Local patch 0003: swap-then-dispose with a guard — StopAsync (resume path) can race
-            // ForceStop (reload belt) on the same CTS; the unguarded dispose here was the last
-            // double-dispose candidate.
-            var lifecycle = _lifecycleCts;
+            _lifecycleCts.Dispose();
             _lifecycleCts = null;
-            try { lifecycle?.Dispose(); } catch { }
         }
 
         /// <summary>
@@ -193,17 +178,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         /// Skips the graceful WebSocket close handshake and just disposes resources immediately.
         /// The server handles ungraceful disconnects via its ping timeout.
         /// </summary>
-        /// <returns>Local patch 0003: true when the client had ANY live work at entry (socket, a
-        /// loop, or a reconnect in flight) — "IsRunning" alone misses a mid-reconnect client, and
-        /// callers use this to decide whether a post-reload resume is warranted.</returns>
-        public bool ForceStop()
+        public void ForceStop()
         {
             // Latch teardown FIRST so no reconnect/loop can start while we unwind (see _shuttingDown).
             _shuttingDown = true;
-            bool hadLiveWork = _isConnected || _socket != null
-                || (_receiveTask != null && !_receiveTask.IsCompleted)
-                || (_keepAliveTask != null && !_keepAliveTask.IsCompleted)
-                || (_reconnectTask != null && !_reconnectTask.IsCompleted);
             McpLog.Info("[WebSocket] ForceStop: begin", false);
             try
             {
@@ -232,62 +210,37 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 //    the socket disposal above, both loops complete in ~ms; the cap only smooths timing.
                 //    If a loop is genuinely wedged (native read that ignored both cancel + dispose), the
                 //    log line below reports done=false so we know the hang is below the managed layer.
-                // Local patch 0003: the reconnect worker is now tracked and waited on alongside the
-                // loops — an unwaited reconnect racing this teardown was the main residual wedge path.
-                Task receive = _receiveTask, keepAlive = _keepAliveTask, reconnect = _reconnectTask;
-                bool allExited = true;
+                Task receive = _receiveTask, keepAlive = _keepAliveTask;
                 try
                 {
-                    var pending = new List<Task>(3);
-                    if (receive != null && !receive.IsCompleted) pending.Add(receive);
-                    if (keepAlive != null && !keepAlive.IsCompleted) pending.Add(keepAlive);
-                    if (reconnect != null && !reconnect.IsCompleted) pending.Add(reconnect);
+                    var pending = new List<Task>(2);
+                    if (receive != null) pending.Add(receive);
+                    if (keepAlive != null) pending.Add(keepAlive);
                     if (pending.Count > 0)
                     {
-                        allExited = Task.WaitAll(pending.ToArray(), TimeSpan.FromMilliseconds(800));
-                        // Which-path-hung log (0003): ALWAYS logged (main thread here, so safe per
-                        // 0002's no-background-logging rule) — if a wedge recurs, this names the culprit.
-                        McpLog.Info(
-                            $"[WebSocket] ForceStop: loops exited within cap = {allExited}"
-                            + $" (receive={(receive == null ? "-" : receive.IsCompleted ? "done" : "LIVE")}"
-                            + $", keepAlive={(keepAlive == null ? "-" : keepAlive.IsCompleted ? "done" : "LIVE")}"
-                            + $", reconnect={(reconnect == null ? "-" : reconnect.IsCompleted ? "done" : "LIVE")})");
+                        bool done = Task.WaitAll(pending.ToArray(), TimeSpan.FromMilliseconds(800));
+                        McpLog.Info($"[WebSocket] ForceStop: loops exited within cap = {done}", false);
                     }
                 }
-                catch { allExited = false; /* AggregateException(TaskCanceled/faulted) from the unwinding loops is expected. */ }
+                catch { /* AggregateException(TaskCanceled/faulted) from the unwinding loops is expected. */ }
 
                 try { _connectionCts?.Dispose(); } catch { }
                 _connectionCts = null;
                 _receiveTask = null;
                 _keepAliveTask = null;
-                _reconnectTask = null;
                 Interlocked.Exchange(ref _isReconnectingFlag, 0);
                 _isConnected = false;
                 _state = TransportState.Disconnected(TransportDisplayName);
 
                 try { _lifecycleCts?.Dispose(); } catch { }
                 _lifecycleCts = null;
-
-                // Local patch 0003: only lift the teardown latch when every worker provably exited.
-                // The old unconditional `finally { _shuttingDown = false; }` re-opened the gate while a
-                // straggler could still be unwinding — letting it resurrect the connection INSIDE the
-                // reload freeze. A latched (zombie) client is harmless: StartAsync clears the latch on
-                // the next deliberate start, and after a domain reload this instance is dead anyway.
-                if (allExited)
-                {
-                    _shuttingDown = false;
-                }
-                else
-                {
-                    McpLog.Warn("[WebSocket] ForceStop: a worker missed the exit cap — leaving teardown latched (next StartAsync clears it).");
-                }
                 McpLog.Info("[WebSocket] ForceStop: done", false);
             }
-            catch
+            finally
             {
-                // Never throw out of a reload hook; the latch stays set, StartAsync clears it.
+                // Clear the latch so a later (manual or post-reload) reconnect can start loops again.
+                _shuttingDown = false;
             }
-            return hadLiveWork;
         }
 
         public async Task<bool> VerifyAsync()
@@ -341,33 +294,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private async Task<bool> EstablishConnectionAsync(CancellationToken token)
         {
-            // Local patch 0003: never open (or re-open) a connection while a synchronous teardown is
-            // in flight — this is the path that used to resurrect `_socket` after ForceStop nulled it.
-            if (_shuttingDown || token.IsCancellationRequested)
-            {
-                return false;
-            }
-
             await StopConnectionLoopsAsync().ConfigureAwait(false);
 
-            // Local patch 0003: swap-then-dispose with a guard. The old unguarded `_connectionCts
-            // ?.Dispose()` raced ForceStop's own disposal of the same CTS (the "already disposed
-            // CancellationTokenSource" fingerprint in Editor.log right before a wedge).
-            var oldConnectionCts = _connectionCts;
-            _connectionCts = null;
-            try { oldConnectionCts?.Dispose(); } catch { }
-            CancellationTokenSource freshCts;
-            try
-            {
-                freshCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-            }
-            catch (ObjectDisposedException)
-            {
-                // The lifecycle CTS behind `token` was disposed by a concurrent teardown — bail out.
-                return false;
-            }
-            _connectionCts = freshCts;
-            CancellationToken connectionToken = freshCts.Token;
+            _connectionCts?.Dispose();
+            _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            CancellationToken connectionToken = _connectionCts.Token;
 
             Uri originalEndpoint = _endpointUri;
             Uri connectedEndpoint = null;
@@ -473,12 +404,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 }
             }
 
-            // Local patch 0003: swap-then-dispose with a guard — this ran concurrently with
-            // ForceStop's disposal of the same CTS (double-dispose) when a reconnect cycle
-            // straddled a domain reload.
-            var cts = _connectionCts;
-            _connectionCts = null;
-            try { cts?.Dispose(); } catch { }
+            if (_connectionCts != null)
+            {
+                _connectionCts.Dispose();
+                _connectionCts = null;
+            }
         }
 
         private void StartBackgroundLoops(CancellationToken token)
@@ -925,13 +855,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             await StopConnectionLoopsAsync(awaitTasks: false).ConfigureAwait(false);
 
-            // Local patch 0003: latch can have flipped while we were stopping loops — re-check before
-            // spawning, use the LOCAL lifecycle copy (the field may be nulled by ForceStop by now —
-            // the old `_lifecycleCts.Token` here was a live NullReferenceException), and TRACK the
-            // task so ForceStop can wait for it (see _reconnectTask).
-            if (_shuttingDown) { Interlocked.Exchange(ref _isReconnectingFlag, 0); return; }
-            CancellationToken reconnectToken = lifecycle.Token;
-            _reconnectTask = Task.Run(() => AttemptReconnectAsync(reconnectToken), CancellationToken.None);
+            _ = Task.Run(() => AttemptReconnectAsync(_lifecycleCts.Token), CancellationToken.None);
         }
 
         private async Task AttemptReconnectAsync(CancellationToken token)
@@ -942,9 +866,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
                 foreach (TimeSpan delay in ReconnectSchedule)
                 {
-                    // Local patch 0003: bail the moment a synchronous teardown latches — a reconnect
-                    // surviving into ForceStop used to resurrect the socket during the reload freeze.
-                    if (_shuttingDown || token.IsCancellationRequested)
+                    if (token.IsCancellationRequested)
                     {
                         return;
                     }
@@ -968,7 +890,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 // server outage longer than ~49 s doesn't leave the plugin permanently dead.
                 McpLog.Warn($"[WebSocket] Initial reconnect schedule exhausted. Retrying every {ReconnectTailInterval.TotalSeconds}s until cancelled.");
                 _state = _state.WithError($"Server unreachable – retrying every {ReconnectTailInterval.TotalSeconds} s");
-                while (!_shuttingDown && !token.IsCancellationRequested)
+                while (!token.IsCancellationRequested)
                 {
                     try { await Task.Delay(ReconnectTailInterval, token).ConfigureAwait(false); }
                     catch (OperationCanceledException) { return; }

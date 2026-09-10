@@ -46,92 +46,6 @@ namespace MCPForUnity.Editor.Services
 
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
-
-            // Local patch 0003 — tear the bridge down EARLY, before the reload freeze window.
-            // beforeAssemblyReload fires milliseconds before Unity freezes the world, which gives the
-            // transport's background threads only ForceStop's bounded wait to unwind; any straggler
-            // (e.g. an in-flight reconnect) then enters the domain unload alive = the 100%-CPU
-            // "Reload Script Assemblies" wedge. compilationStarted fires SECONDS earlier (every
-            // script compile), and ExitingEditMode covers the compile-less play-mode reload — after
-            // an early teardown the threads unwind on a live, unfrozen editor and the
-            // beforeAssemblyReload ForceStop becomes a no-op belt (IsRunning is already false).
-            UnityEditor.Compilation.CompilationPipeline.compilationStarted += _ => EarlyTeardown("compilation started");
-            EditorApplication.playModeStateChanged += change =>
-            {
-                if (change == PlayModeStateChange.ExitingEditMode) EarlyTeardown("entering play mode");
-            };
-        }
-
-        // True while a ResumeTick is subscribed in THIS domain (an actual reload wipes the delegate
-        // and OnAfterAssemblyReload re-arms in the new domain; this guard only prevents double-adds
-        // within one domain, e.g. two compiles before the editor went un-busy).
-        private static bool _resumeTickArmed;
-
-        /// <summary>
-        /// Local patch 0003: pre-freeze teardown (see ctor comment). Also arms the resume tick in
-        /// the CURRENT domain: if this compile never ends in a domain reload (e.g. compilation while
-        /// the reload is deferred), afterAssemblyReload never fires, and without this the bridge
-        /// would stay down until the next reload. The resume machinery is idempotent (flag +
-        /// IsRunning + coalesced StartAsync), so an arm here plus a post-reload arm cannot double-start.
-        /// </summary>
-        private static void EarlyTeardown(string reason)
-        {
-            try
-            {
-                var transport = MCPServiceLocator.TransportManager;
-
-                // Round 3: latch UNCONDITIONALLY — the round-1 `if (!IsRunning) return;` was the
-                // residual wedge: a client mid-reconnect reads as "not running", survived the compile,
-                // and spawned fresh loops straight into the freeze (reproduced after an idle period,
-                // when the connection flaps). ForceStop reports whether ANY live work existed; a truly
-                // cold client is a cheap no-op and gets no resume scheduled.
-                bool wasRunning = transport.IsRunning(TransportMode.Http);
-                bool hadWork = transport.ForceStop(TransportMode.Http);
-                if (!wasRunning && !hadWork) return;
-
-                McpLog.Info($"[HTTP Reload] Early teardown ({reason}) — bridge stopped ahead of the reload freeze (running={wasRunning}, liveWork={hadWork}).");
-                SessionState.SetBool(ResumeSessionKey, true);
-
-                // GRACED tick, never the plain ResumeTick: a compile that ends in a reload has a
-                // short "not busy" gap between compile-finish and reload-begin, and an immediate
-                // resume there RESURRECTS the bridge right before the freeze — reintroducing the
-                // wedge this patch exists to kill (observed live during 0003 verification). The
-                // graced tick requires sustained idle, so an imminent reload always wins (it wipes
-                // this delegate); only a compile that truly never reloads (compile errors) resumes.
-                if (!_resumeTickArmed)
-                {
-                    _resumeTickArmed = true;
-                    _idleSince = double.NaN;
-                    EditorApplication.update += GracedResumeTick;
-                }
-            }
-            catch (Exception ex)
-            {
-                McpLog.Warn($"Early HTTP bridge teardown failed: {ex.Message}");
-            }
-        }
-
-        // Sustained-idle requirement before a pre-reload-armed resume may reconnect (see EarlyTeardown).
-        private const double ResumeIdleGraceSeconds = 5.0;
-        private static double _idleSince = double.NaN;
-
-        private static void GracedResumeTick()
-        {
-            if (IsEditorBusy())
-            {
-                _idleSince = double.NaN; // busy again (e.g. next compile pass) — restart the grace clock
-                return;
-            }
-            if (double.IsNaN(_idleSince))
-            {
-                _idleSince = EditorApplication.timeSinceStartup;
-                return;
-            }
-            if (EditorApplication.timeSinceStartup - _idleSince < ResumeIdleGraceSeconds) return;
-
-            EditorApplication.update -= GracedResumeTick;
-            _resumeTickArmed = false;
-            _ = ResumeHttpWithRetriesAsync();
         }
 
         internal static bool IsResumePending => SessionState.GetBool(ResumeSessionKey, false);
@@ -160,24 +74,21 @@ namespace MCPForUnity.Editor.Services
             if (transport.IsRunning(TransportMode.Http))
             {
                 SessionState.SetBool(ResumeSessionKey, true);
+
+                // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
+                // leave an orphaned socket due to an unfinished async close handshake.
+                transport.ForceStop(TransportMode.Http);
             }
             // When the bridge is not running, leave any pending flag alone: during a multi-pass
             // compile the next reload lands before the deferred resume ran, and deleting the
             // flag here is what used to lose the resume permanently (#1229). Explicit cancel
             // paths (End Session, transport switch, orphan cleanup) erase the flag instead.
-
-            // Local patch 0003: ForceStop UNCONDITIONALLY (it is cheap/idempotent on a stopped
-            // client). "Not running" does not mean "no live work": a resume StartAsync can be
-            // mid-connect right now (IsRunning flips only on success), and only ForceStop's
-            // _shuttingDown latch stops it from spawning loops during the freeze.
-            transport.ForceStop(TransportMode.Http);
         }
 
         private static void OnAfterAssemblyReload()
         {
             if (OnAfterAssemblyReloadCore())
             {
-                _resumeTickArmed = true; // patch 0003: keep the in-domain double-arm guard coherent
                 EditorApplication.update += ResumeTick;
             }
         }
@@ -218,7 +129,6 @@ namespace MCPForUnity.Editor.Services
         {
             if (IsEditorBusy()) return;
             EditorApplication.update -= ResumeTick;
-            _resumeTickArmed = false; // patch 0003: allow a later EarlyTeardown in this domain to re-arm
             _ = ResumeHttpWithRetriesAsync();
         }
 

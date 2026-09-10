@@ -1,0 +1,796 @@
+--- local-patches/backup-0003/WebSocketTransportClient.cs	2026-08-12 05:33:53.502929300 +0300
++++ MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs	2026-08-12 05:57:56.303900500 +0300
+@@ -45,6 +45,12 @@
+         private CancellationTokenSource _connectionCts;
+         private Task _receiveTask;
+         private Task _keepAliveTask;
++        // Local patch 0003: the reconnect worker MUST be tracked. It used to be fire-and-forget
++        // (`_ = Task.Run(AttemptReconnectAsync)`), so ForceStop never waited for it and nothing
++        // stopped it from RESURRECTING the socket mid-teardown — with a flapping server (frequent
++        // reconnect cycles) nearly every domain reload then entered the freeze with a live untracked
++        // task, which is the 100%-CPU "Reload Script Assemblies" wedge the 0001/0002 patches missed.
++        private Task _reconnectTask;
+         private readonly SemaphoreSlim _sendLock = new(1, 1);
+ 
+         private Uri _endpointUri;
+@@ -118,6 +124,11 @@
+ 
+             await StopAsync();
+ 
++            // Local patch 0003: a deliberate (re)start is the ONE place the teardown latch lifts.
++            // ForceStop leaves it set when a worker missed its exit cap; by here StopAsync has
++            // awaited the old loops for real, so a fresh lifecycle is safe.
++            _shuttingDown = false;
++
+             _lifecycleCts = new CancellationTokenSource();
+             _endpointUri = BuildWebSocketUri(HttpEndpointUtility.GetBaseUrl());
+             _sessionId = null;
+@@ -169,8 +180,12 @@
+             _isConnected = false;
+             _state = TransportState.Disconnected(TransportDisplayName);
+ 
+-            _lifecycleCts.Dispose();
++            // Local patch 0003: swap-then-dispose with a guard — StopAsync (resume path) can race
++            // ForceStop (reload belt) on the same CTS; the unguarded dispose here was the last
++            // double-dispose candidate.
++            var lifecycle = _lifecycleCts;
+             _lifecycleCts = null;
++            try { lifecycle?.Dispose(); } catch { }
+         }
+ 
+         /// <summary>
+@@ -178,10 +193,17 @@
+         /// Skips the graceful WebSocket close handshake and just disposes resources immediately.
+         /// The server handles ungraceful disconnects via its ping timeout.
+         /// </summary>
+-        public void ForceStop()
++        /// <returns>Local patch 0003: true when the client had ANY live work at entry (socket, a
++        /// loop, or a reconnect in flight) — "IsRunning" alone misses a mid-reconnect client, and
++        /// callers use this to decide whether a post-reload resume is warranted.</returns>
++        public bool ForceStop()
+         {
+             // Latch teardown FIRST so no reconnect/loop can start while we unwind (see _shuttingDown).
+             _shuttingDown = true;
++            bool hadLiveWork = _isConnected || _socket != null
++                || (_receiveTask != null && !_receiveTask.IsCompleted)
++                || (_keepAliveTask != null && !_keepAliveTask.IsCompleted)
++                || (_reconnectTask != null && !_reconnectTask.IsCompleted);
+             McpLog.Info("[WebSocket] ForceStop: begin", false);
+             try
+             {
+@@ -210,37 +232,62 @@
+                 //    the socket disposal above, both loops complete in ~ms; the cap only smooths timing.
+                 //    If a loop is genuinely wedged (native read that ignored both cancel + dispose), the
+                 //    log line below reports done=false so we know the hang is below the managed layer.
+-                Task receive = _receiveTask, keepAlive = _keepAliveTask;
++                // Local patch 0003: the reconnect worker is now tracked and waited on alongside the
++                // loops — an unwaited reconnect racing this teardown was the main residual wedge path.
++                Task receive = _receiveTask, keepAlive = _keepAliveTask, reconnect = _reconnectTask;
++                bool allExited = true;
+                 try
+                 {
+-                    var pending = new List<Task>(2);
+-                    if (receive != null) pending.Add(receive);
+-                    if (keepAlive != null) pending.Add(keepAlive);
++                    var pending = new List<Task>(3);
++                    if (receive != null && !receive.IsCompleted) pending.Add(receive);
++                    if (keepAlive != null && !keepAlive.IsCompleted) pending.Add(keepAlive);
++                    if (reconnect != null && !reconnect.IsCompleted) pending.Add(reconnect);
+                     if (pending.Count > 0)
+                     {
+-                        bool done = Task.WaitAll(pending.ToArray(), TimeSpan.FromMilliseconds(800));
+-                        McpLog.Info($"[WebSocket] ForceStop: loops exited within cap = {done}", false);
++                        allExited = Task.WaitAll(pending.ToArray(), TimeSpan.FromMilliseconds(800));
++                        // Which-path-hung log (0003): ALWAYS logged (main thread here, so safe per
++                        // 0002's no-background-logging rule) — if a wedge recurs, this names the culprit.
++                        McpLog.Info(
++                            $"[WebSocket] ForceStop: loops exited within cap = {allExited}"
++                            + $" (receive={(receive == null ? "-" : receive.IsCompleted ? "done" : "LIVE")}"
++                            + $", keepAlive={(keepAlive == null ? "-" : keepAlive.IsCompleted ? "done" : "LIVE")}"
++                            + $", reconnect={(reconnect == null ? "-" : reconnect.IsCompleted ? "done" : "LIVE")})");
+                     }
+                 }
+-                catch { /* AggregateException(TaskCanceled/faulted) from the unwinding loops is expected. */ }
++                catch { allExited = false; /* AggregateException(TaskCanceled/faulted) from the unwinding loops is expected. */ }
+ 
+                 try { _connectionCts?.Dispose(); } catch { }
+                 _connectionCts = null;
+                 _receiveTask = null;
+                 _keepAliveTask = null;
++                _reconnectTask = null;
+                 Interlocked.Exchange(ref _isReconnectingFlag, 0);
+                 _isConnected = false;
+                 _state = TransportState.Disconnected(TransportDisplayName);
+ 
+                 try { _lifecycleCts?.Dispose(); } catch { }
+                 _lifecycleCts = null;
++
++                // Local patch 0003: only lift the teardown latch when every worker provably exited.
++                // The old unconditional `finally { _shuttingDown = false; }` re-opened the gate while a
++                // straggler could still be unwinding — letting it resurrect the connection INSIDE the
++                // reload freeze. A latched (zombie) client is harmless: StartAsync clears the latch on
++                // the next deliberate start, and after a domain reload this instance is dead anyway.
++                if (allExited)
++                {
++                    _shuttingDown = false;
++                }
++                else
++                {
++                    McpLog.Warn("[WebSocket] ForceStop: a worker missed the exit cap — leaving teardown latched (next StartAsync clears it).");
++                }
+                 McpLog.Info("[WebSocket] ForceStop: done", false);
+             }
+-            finally
++            catch
+             {
+-                // Clear the latch so a later (manual or post-reload) reconnect can start loops again.
+-                _shuttingDown = false;
++                // Never throw out of a reload hook; the latch stays set, StartAsync clears it.
+             }
++            return hadLiveWork;
+         }
+ 
+         public async Task<bool> VerifyAsync()
+@@ -294,11 +341,33 @@
+ 
+         private async Task<bool> EstablishConnectionAsync(CancellationToken token)
+         {
++            // Local patch 0003: never open (or re-open) a connection while a synchronous teardown is
++            // in flight — this is the path that used to resurrect `_socket` after ForceStop nulled it.
++            if (_shuttingDown || token.IsCancellationRequested)
++            {
++                return false;
++            }
++
+             await StopConnectionLoopsAsync().ConfigureAwait(false);
+ 
+-            _connectionCts?.Dispose();
+-            _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+-            CancellationToken connectionToken = _connectionCts.Token;
++            // Local patch 0003: swap-then-dispose with a guard. The old unguarded `_connectionCts
++            // ?.Dispose()` raced ForceStop's own disposal of the same CTS (the "already disposed
++            // CancellationTokenSource" fingerprint in Editor.log right before a wedge).
++            var oldConnectionCts = _connectionCts;
++            _connectionCts = null;
++            try { oldConnectionCts?.Dispose(); } catch { }
++            CancellationTokenSource freshCts;
++            try
++            {
++                freshCts = CancellationTokenSource.CreateLinkedTokenSource(token);
++            }
++            catch (ObjectDisposedException)
++            {
++                // The lifecycle CTS behind `token` was disposed by a concurrent teardown — bail out.
++                return false;
++            }
++            _connectionCts = freshCts;
++            CancellationToken connectionToken = freshCts.Token;
+ 
+             Uri originalEndpoint = _endpointUri;
+             Uri connectedEndpoint = null;
+@@ -404,11 +473,12 @@
+                 }
+             }
+ 
+-            if (_connectionCts != null)
+-            {
+-                _connectionCts.Dispose();
+-                _connectionCts = null;
+-            }
++            // Local patch 0003: swap-then-dispose with a guard — this ran concurrently with
++            // ForceStop's disposal of the same CTS (double-dispose) when a reconnect cycle
++            // straddled a domain reload.
++            var cts = _connectionCts;
++            _connectionCts = null;
++            try { cts?.Dispose(); } catch { }
+         }
+ 
+         private void StartBackgroundLoops(CancellationToken token)
+@@ -855,7 +925,13 @@
+ 
+             await StopConnectionLoopsAsync(awaitTasks: false).ConfigureAwait(false);
+ 
+-            _ = Task.Run(() => AttemptReconnectAsync(_lifecycleCts.Token), CancellationToken.None);
++            // Local patch 0003: latch can have flipped while we were stopping loops — re-check before
++            // spawning, use the LOCAL lifecycle copy (the field may be nulled by ForceStop by now —
++            // the old `_lifecycleCts.Token` here was a live NullReferenceException), and TRACK the
++            // task so ForceStop can wait for it (see _reconnectTask).
++            if (_shuttingDown) { Interlocked.Exchange(ref _isReconnectingFlag, 0); return; }
++            CancellationToken reconnectToken = lifecycle.Token;
++            _reconnectTask = Task.Run(() => AttemptReconnectAsync(reconnectToken), CancellationToken.None);
+         }
+ 
+         private async Task AttemptReconnectAsync(CancellationToken token)
+@@ -866,7 +942,9 @@
+ 
+                 foreach (TimeSpan delay in ReconnectSchedule)
+                 {
+-                    if (token.IsCancellationRequested)
++                    // Local patch 0003: bail the moment a synchronous teardown latches — a reconnect
++                    // surviving into ForceStop used to resurrect the socket during the reload freeze.
++                    if (_shuttingDown || token.IsCancellationRequested)
+                     {
+                         return;
+                     }
+@@ -890,7 +968,7 @@
+                 // server outage longer than ~49 s doesn't leave the plugin permanently dead.
+                 McpLog.Warn($"[WebSocket] Initial reconnect schedule exhausted. Retrying every {ReconnectTailInterval.TotalSeconds}s until cancelled.");
+                 _state = _state.WithError($"Server unreachable – retrying every {ReconnectTailInterval.TotalSeconds} s");
+-                while (!token.IsCancellationRequested)
++                while (!_shuttingDown && !token.IsCancellationRequested)
+                 {
+                     try { await Task.Delay(ReconnectTailInterval, token).ConfigureAwait(false); }
+                     catch (OperationCanceledException) { return; }
+--- local-patches/backup-0003/HttpBridgeReloadHandler.cs	2026-08-12 05:33:53.528063100 +0300
++++ MCPForUnity/Editor/Services/HttpBridgeReloadHandler.cs	2026-08-12 05:58:18.655657900 +0300
+@@ -46,6 +46,92 @@
+ 
+             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
++
++            // Local patch 0003 — tear the bridge down EARLY, before the reload freeze window.
++            // beforeAssemblyReload fires milliseconds before Unity freezes the world, which gives the
++            // transport's background threads only ForceStop's bounded wait to unwind; any straggler
++            // (e.g. an in-flight reconnect) then enters the domain unload alive = the 100%-CPU
++            // "Reload Script Assemblies" wedge. compilationStarted fires SECONDS earlier (every
++            // script compile), and ExitingEditMode covers the compile-less play-mode reload — after
++            // an early teardown the threads unwind on a live, unfrozen editor and the
++            // beforeAssemblyReload ForceStop becomes a no-op belt (IsRunning is already false).
++            UnityEditor.Compilation.CompilationPipeline.compilationStarted += _ => EarlyTeardown("compilation started");
++            EditorApplication.playModeStateChanged += change =>
++            {
++                if (change == PlayModeStateChange.ExitingEditMode) EarlyTeardown("entering play mode");
++            };
++        }
++
++        // True while a ResumeTick is subscribed in THIS domain (an actual reload wipes the delegate
++        // and OnAfterAssemblyReload re-arms in the new domain; this guard only prevents double-adds
++        // within one domain, e.g. two compiles before the editor went un-busy).
++        private static bool _resumeTickArmed;
++
++        /// <summary>
++        /// Local patch 0003: pre-freeze teardown (see ctor comment). Also arms the resume tick in
++        /// the CURRENT domain: if this compile never ends in a domain reload (e.g. compilation while
++        /// the reload is deferred), afterAssemblyReload never fires, and without this the bridge
++        /// would stay down until the next reload. The resume machinery is idempotent (flag +
++        /// IsRunning + coalesced StartAsync), so an arm here plus a post-reload arm cannot double-start.
++        /// </summary>
++        private static void EarlyTeardown(string reason)
++        {
++            try
++            {
++                var transport = MCPServiceLocator.TransportManager;
++
++                // Round 3: latch UNCONDITIONALLY — the round-1 `if (!IsRunning) return;` was the
++                // residual wedge: a client mid-reconnect reads as "not running", survived the compile,
++                // and spawned fresh loops straight into the freeze (reproduced after an idle period,
++                // when the connection flaps). ForceStop reports whether ANY live work existed; a truly
++                // cold client is a cheap no-op and gets no resume scheduled.
++                bool wasRunning = transport.IsRunning(TransportMode.Http);
++                bool hadWork = transport.ForceStop(TransportMode.Http);
++                if (!wasRunning && !hadWork) return;
++
++                McpLog.Info($"[HTTP Reload] Early teardown ({reason}) — bridge stopped ahead of the reload freeze (running={wasRunning}, liveWork={hadWork}).");
++                SessionState.SetBool(ResumeSessionKey, true);
++
++                // GRACED tick, never the plain ResumeTick: a compile that ends in a reload has a
++                // short "not busy" gap between compile-finish and reload-begin, and an immediate
++                // resume there RESURRECTS the bridge right before the freeze — reintroducing the
++                // wedge this patch exists to kill (observed live during 0003 verification). The
++                // graced tick requires sustained idle, so an imminent reload always wins (it wipes
++                // this delegate); only a compile that truly never reloads (compile errors) resumes.
++                if (!_resumeTickArmed)
++                {
++                    _resumeTickArmed = true;
++                    _idleSince = double.NaN;
++                    EditorApplication.update += GracedResumeTick;
++                }
++            }
++            catch (Exception ex)
++            {
++                McpLog.Warn($"Early HTTP bridge teardown failed: {ex.Message}");
++            }
++        }
++
++        // Sustained-idle requirement before a pre-reload-armed resume may reconnect (see EarlyTeardown).
++        private const double ResumeIdleGraceSeconds = 5.0;
++        private static double _idleSince = double.NaN;
++
++        private static void GracedResumeTick()
++        {
++            if (IsEditorBusy())
++            {
++                _idleSince = double.NaN; // busy again (e.g. next compile pass) — restart the grace clock
++                return;
++            }
++            if (double.IsNaN(_idleSince))
++            {
++                _idleSince = EditorApplication.timeSinceStartup;
++                return;
++            }
++            if (EditorApplication.timeSinceStartup - _idleSince < ResumeIdleGraceSeconds) return;
++
++            EditorApplication.update -= GracedResumeTick;
++            _resumeTickArmed = false;
++            _ = ResumeHttpWithRetriesAsync();
+         }
+ 
+         internal static bool IsResumePending => SessionState.GetBool(ResumeSessionKey, false);
+@@ -74,21 +160,24 @@
+             if (transport.IsRunning(TransportMode.Http))
+             {
+                 SessionState.SetBool(ResumeSessionKey, true);
+-
+-                // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
+-                // leave an orphaned socket due to an unfinished async close handshake.
+-                transport.ForceStop(TransportMode.Http);
+             }
+             // When the bridge is not running, leave any pending flag alone: during a multi-pass
+             // compile the next reload lands before the deferred resume ran, and deleting the
+             // flag here is what used to lose the resume permanently (#1229). Explicit cancel
+             // paths (End Session, transport switch, orphan cleanup) erase the flag instead.
++
++            // Local patch 0003: ForceStop UNCONDITIONALLY (it is cheap/idempotent on a stopped
++            // client). "Not running" does not mean "no live work": a resume StartAsync can be
++            // mid-connect right now (IsRunning flips only on success), and only ForceStop's
++            // _shuttingDown latch stops it from spawning loops during the freeze.
++            transport.ForceStop(TransportMode.Http);
+         }
+ 
+         private static void OnAfterAssemblyReload()
+         {
+             if (OnAfterAssemblyReloadCore())
+             {
++                _resumeTickArmed = true; // patch 0003: keep the in-domain double-arm guard coherent
+                 EditorApplication.update += ResumeTick;
+             }
+         }
+@@ -129,6 +218,7 @@
+         {
+             if (IsEditorBusy()) return;
+             EditorApplication.update -= ResumeTick;
++            _resumeTickArmed = false; // patch 0003: allow a later EarlyTeardown in this domain to re-arm
+             _ = ResumeHttpWithRetriesAsync();
+         }
+ 
+--- local-patches/backup-0003/TransportManager.cs	2026-08-12 05:58:40.506466100 +0300
++++ MCPForUnity/Editor/Services/Transport/TransportManager.cs	2026-08-12 05:58:04.392841600 +0300
+@@ -1,216 +1,222 @@
+-using System;
+-using System.Threading.Tasks;
+-using MCPForUnity.Editor.Helpers;
+-using MCPForUnity.Editor.Services.Transport.Transports;
+-
+-namespace MCPForUnity.Editor.Services.Transport
+-{
+-    /// <summary>
+-    /// Coordinates the active transport client and exposes lifecycle helpers.
+-    /// </summary>
+-    public class TransportManager
+-    {
+-        private IMcpTransportClient _httpClient;
+-        private IMcpTransportClient _stdioClient;
+-        private TransportState _httpState = TransportState.Disconnected("http");
+-        private TransportState _stdioState = TransportState.Disconnected("stdio");
+-        private Func<IMcpTransportClient> _webSocketFactory;
+-        private Func<IMcpTransportClient> _stdioFactory;
+-        private Task<bool> _httpStartTask;
+-        private Task<bool> _stdioStartTask;
+-
+-        public TransportManager()
+-        {
+-            Configure(
+-                () => new WebSocketTransportClient(MCPServiceLocator.ToolDiscovery),
+-                () => new StdioTransportClient());
+-        }
+-
+-        public void Configure(
+-            Func<IMcpTransportClient> webSocketFactory,
+-            Func<IMcpTransportClient> stdioFactory)
+-        {
+-            _webSocketFactory = webSocketFactory ?? throw new ArgumentNullException(nameof(webSocketFactory));
+-            _stdioFactory = stdioFactory ?? throw new ArgumentNullException(nameof(stdioFactory));
+-        }
+-
+-        private IMcpTransportClient GetOrCreateClient(TransportMode mode)
+-        {
+-            return mode switch
+-            {
+-                TransportMode.Http => _httpClient ??= _webSocketFactory(),
+-                TransportMode.Stdio => _stdioClient ??= _stdioFactory(),
+-                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
+-            };
+-        }
+-
+-        public Task<bool> StartAsync(TransportMode mode)
+-        {
+-            // Editor-main-thread only (no locking needed). Coalesce concurrent starts for the
+-            // same mode: manual Connect, reload-resume, and auto-start can otherwise race, and
+-            // WebSocketTransportClient.StartAsync tears down a live connection first — two
+-            // interleaved starts bounce each other's session.
+-            Task<bool> inFlight = mode switch
+-            {
+-                TransportMode.Http => _httpStartTask,
+-                TransportMode.Stdio => _stdioStartTask,
+-                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
+-            };
+-            if (inFlight != null && !inFlight.IsCompleted)
+-            {
+-                return inFlight;
+-            }
+-
+-            Task<bool> started = StartCoreAsync(mode);
+-            if (mode == TransportMode.Http) _httpStartTask = started;
+-            else _stdioStartTask = started;
+-            return started;
+-        }
+-
+-        private async Task<bool> StartCoreAsync(TransportMode mode)
+-        {
+-            IMcpTransportClient client = GetOrCreateClient(mode);
+-
+-            bool started = await client.StartAsync();
+-            if (!started)
+-            {
+-                try
+-                {
+-                    await client.StopAsync();
+-                }
+-                catch (Exception ex)
+-                {
+-                    McpLog.Warn($"Error while stopping transport {client.TransportName}: {ex.Message}");
+-                }
+-                UpdateState(mode, TransportState.Disconnected(client.TransportName, client.State?.Error ?? "Failed to start"));
+-                return false;
+-            }
+-
+-            UpdateState(mode, client.State ?? TransportState.Connected(client.TransportName));
+-            return true;
+-        }
+-
+-        public async Task StopAsync(TransportMode? mode = null)
+-        {
+-            async Task StopClient(IMcpTransportClient client, TransportMode clientMode)
+-            {
+-                if (client == null) return;
+-                try { await client.StopAsync(); }
+-                catch (Exception ex) { McpLog.Warn($"Error while stopping transport {client.TransportName}: {ex.Message}"); }
+-                finally { UpdateState(clientMode, TransportState.Disconnected(client.TransportName)); }
+-            }
+-
+-            if (mode == null)
+-            {
+-                await StopClient(_httpClient, TransportMode.Http);
+-                await StopClient(_stdioClient, TransportMode.Stdio);
+-                return;
+-            }
+-
+-            if (mode == TransportMode.Http)
+-            {
+-                await StopClient(_httpClient, TransportMode.Http);
+-            }
+-            else
+-            {
+-                await StopClient(_stdioClient, TransportMode.Stdio);
+-            }
+-        }
+-
+-        public async Task<bool> VerifyAsync(TransportMode mode)
+-        {
+-            IMcpTransportClient client = GetClient(mode);
+-            if (client == null)
+-            {
+-                return false;
+-            }
+-
+-            bool ok = await client.VerifyAsync();
+-            var state = client.State ?? TransportState.Disconnected(client.TransportName, "No state reported");
+-            UpdateState(mode, state);
+-            return ok;
+-        }
+-
+-        public TransportState GetState(TransportMode mode)
+-        {
+-            return mode switch
+-            {
+-                TransportMode.Http => _httpState,
+-                TransportMode.Stdio => _stdioState,
+-                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
+-            };
+-        }
+-
+-        public bool IsRunning(TransportMode mode) => GetState(mode).IsConnected;
+-
+-        /// <summary>
+-        /// Synchronous teardown for shutdown/reload hooks where async awaits are not possible.
+-        /// </summary>
+-        public void ForceStop(TransportMode mode)
+-        {
+-            IMcpTransportClient client = GetClient(mode);
+-            string transportName = client?.TransportName ?? mode.ToString().ToLowerInvariant();
+-
+-            if (client == null)
+-            {
+-                UpdateState(mode, TransportState.Disconnected(transportName));
+-                return;
+-            }
+-
+-            try
+-            {
+-                if (client is WebSocketTransportClient wsClient)
+-                {
+-                    wsClient.ForceStop();
+-                }
+-                else
+-                {
+-                    client.StopAsync().GetAwaiter().GetResult();
+-                }
+-            }
+-            catch (Exception ex)
+-            {
+-                McpLog.Warn($"Error while force-stopping transport {transportName}: {ex.Message}");
+-            }
+-            finally
+-            {
+-                UpdateState(mode, TransportState.Disconnected(transportName));
+-            }
+-        }
+-
+-        /// <summary>
+-        /// Gets the active transport client for the specified mode.
+-        /// Returns null if the client hasn't been created yet.
+-        /// </summary>
+-        public IMcpTransportClient GetClient(TransportMode mode)
+-        {
+-            return mode switch
+-            {
+-                TransportMode.Http => _httpClient,
+-                TransportMode.Stdio => _stdioClient,
+-                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
+-            };
+-        }
+-
+-        private void UpdateState(TransportMode mode, TransportState state)
+-        {
+-            switch (mode)
+-            {
+-                case TransportMode.Http:
+-                    _httpState = state;
+-                    break;
+-                case TransportMode.Stdio:
+-                    _stdioState = state;
+-                    break;
+-                default:
+-                    throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode");
+-            }
+-        }
+-    }
+-
+-    public enum TransportMode
+-    {
+-        Http,
+-        Stdio
+-    }
+-}
++using System;
++using System.Threading.Tasks;
++using MCPForUnity.Editor.Helpers;
++using MCPForUnity.Editor.Services.Transport.Transports;
++
++namespace MCPForUnity.Editor.Services.Transport
++{
++    /// <summary>
++    /// Coordinates the active transport client and exposes lifecycle helpers.
++    /// </summary>
++    public class TransportManager
++    {
++        private IMcpTransportClient _httpClient;
++        private IMcpTransportClient _stdioClient;
++        private TransportState _httpState = TransportState.Disconnected("http");
++        private TransportState _stdioState = TransportState.Disconnected("stdio");
++        private Func<IMcpTransportClient> _webSocketFactory;
++        private Func<IMcpTransportClient> _stdioFactory;
++        private Task<bool> _httpStartTask;
++        private Task<bool> _stdioStartTask;
++
++        public TransportManager()
++        {
++            Configure(
++                () => new WebSocketTransportClient(MCPServiceLocator.ToolDiscovery),
++                () => new StdioTransportClient());
++        }
++
++        public void Configure(
++            Func<IMcpTransportClient> webSocketFactory,
++            Func<IMcpTransportClient> stdioFactory)
++        {
++            _webSocketFactory = webSocketFactory ?? throw new ArgumentNullException(nameof(webSocketFactory));
++            _stdioFactory = stdioFactory ?? throw new ArgumentNullException(nameof(stdioFactory));
++        }
++
++        private IMcpTransportClient GetOrCreateClient(TransportMode mode)
++        {
++            return mode switch
++            {
++                TransportMode.Http => _httpClient ??= _webSocketFactory(),
++                TransportMode.Stdio => _stdioClient ??= _stdioFactory(),
++                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
++            };
++        }
++
++        public Task<bool> StartAsync(TransportMode mode)
++        {
++            // Editor-main-thread only (no locking needed). Coalesce concurrent starts for the
++            // same mode: manual Connect, reload-resume, and auto-start can otherwise race, and
++            // WebSocketTransportClient.StartAsync tears down a live connection first — two
++            // interleaved starts bounce each other's session.
++            Task<bool> inFlight = mode switch
++            {
++                TransportMode.Http => _httpStartTask,
++                TransportMode.Stdio => _stdioStartTask,
++                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
++            };
++            if (inFlight != null && !inFlight.IsCompleted)
++            {
++                return inFlight;
++            }
++
++            Task<bool> started = StartCoreAsync(mode);
++            if (mode == TransportMode.Http) _httpStartTask = started;
++            else _stdioStartTask = started;
++            return started;
++        }
++
++        private async Task<bool> StartCoreAsync(TransportMode mode)
++        {
++            IMcpTransportClient client = GetOrCreateClient(mode);
++
++            bool started = await client.StartAsync();
++            if (!started)
++            {
++                try
++                {
++                    await client.StopAsync();
++                }
++                catch (Exception ex)
++                {
++                    McpLog.Warn($"Error while stopping transport {client.TransportName}: {ex.Message}");
++                }
++                UpdateState(mode, TransportState.Disconnected(client.TransportName, client.State?.Error ?? "Failed to start"));
++                return false;
++            }
++
++            UpdateState(mode, client.State ?? TransportState.Connected(client.TransportName));
++            return true;
++        }
++
++        public async Task StopAsync(TransportMode? mode = null)
++        {
++            async Task StopClient(IMcpTransportClient client, TransportMode clientMode)
++            {
++                if (client == null) return;
++                try { await client.StopAsync(); }
++                catch (Exception ex) { McpLog.Warn($"Error while stopping transport {client.TransportName}: {ex.Message}"); }
++                finally { UpdateState(clientMode, TransportState.Disconnected(client.TransportName)); }
++            }
++
++            if (mode == null)
++            {
++                await StopClient(_httpClient, TransportMode.Http);
++                await StopClient(_stdioClient, TransportMode.Stdio);
++                return;
++            }
++
++            if (mode == TransportMode.Http)
++            {
++                await StopClient(_httpClient, TransportMode.Http);
++            }
++            else
++            {
++                await StopClient(_stdioClient, TransportMode.Stdio);
++            }
++        }
++
++        public async Task<bool> VerifyAsync(TransportMode mode)
++        {
++            IMcpTransportClient client = GetClient(mode);
++            if (client == null)
++            {
++                return false;
++            }
++
++            bool ok = await client.VerifyAsync();
++            var state = client.State ?? TransportState.Disconnected(client.TransportName, "No state reported");
++            UpdateState(mode, state);
++            return ok;
++        }
++
++        public TransportState GetState(TransportMode mode)
++        {
++            return mode switch
++            {
++                TransportMode.Http => _httpState,
++                TransportMode.Stdio => _stdioState,
++                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
++            };
++        }
++
++        public bool IsRunning(TransportMode mode) => GetState(mode).IsConnected;
++
++        /// <summary>
++        /// Synchronous teardown for shutdown/reload hooks where async awaits are not possible.
++        /// Local patch 0003: returns true when the client had live work at entry (a connection,
++        /// a loop, or an in-flight reconnect) — callers use this to decide whether to schedule a
++        /// resume; "IsRunning" alone misses a client that is mid-reconnect.
++        /// </summary>
++        public bool ForceStop(TransportMode mode)
++        {
++            IMcpTransportClient client = GetClient(mode);
++            string transportName = client?.TransportName ?? mode.ToString().ToLowerInvariant();
++
++            if (client == null)
++            {
++                UpdateState(mode, TransportState.Disconnected(transportName));
++                return false;
++            }
++
++            bool hadLiveWork = false;
++            try
++            {
++                if (client is WebSocketTransportClient wsClient)
++                {
++                    hadLiveWork = wsClient.ForceStop();
++                }
++                else
++                {
++                    hadLiveWork = client.State?.IsConnected == true;
++                    client.StopAsync().GetAwaiter().GetResult();
++                }
++            }
++            catch (Exception ex)
++            {
++                McpLog.Warn($"Error while force-stopping transport {transportName}: {ex.Message}");
++            }
++            finally
++            {
++                UpdateState(mode, TransportState.Disconnected(transportName));
++            }
++            return hadLiveWork;
++        }
++
++        /// <summary>
++        /// Gets the active transport client for the specified mode.
++        /// Returns null if the client hasn't been created yet.
++        /// </summary>
++        public IMcpTransportClient GetClient(TransportMode mode)
++        {
++            return mode switch
++            {
++                TransportMode.Http => _httpClient,
++                TransportMode.Stdio => _stdioClient,
++                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
++            };
++        }
++
++        private void UpdateState(TransportMode mode, TransportState state)
++        {
++            switch (mode)
++            {
++                case TransportMode.Http:
++                    _httpState = state;
++                    break;
++                case TransportMode.Stdio:
++                    _stdioState = state;
++                    break;
++                default:
++                    throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode");
++            }
++        }
++    }
++
++    public enum TransportMode
++    {
++        Http,
++        Stdio
++    }
++}

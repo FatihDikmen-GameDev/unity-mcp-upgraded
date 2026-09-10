@@ -1,0 +1,61 @@
+diff --git a/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs b/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs
+index 8aaf2249..e70251fe 100644
+--- a/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs
++++ b/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs
+@@ -175,6 +175,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+         /// </summary>
+         public void ForceStop()
+         {
++            // Signal cancellation and kill the socket FIRST. This unblocks the receive loop (normally
++            // parked in an awaited socket read) and — because HandleSocketClosureAsync bails out when
++            // the lifecycle token is already cancelled — guarantees the loop exits WITHOUT kicking off
++            // a reconnect that would race this teardown.
+             try { _lifecycleCts?.Cancel(); } catch { }
+             try { _connectionCts?.Cancel(); } catch { }
+ 
+@@ -185,6 +189,25 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+                 _socket = null;
+             }
+ 
++            // CRITICAL (fixes the domain-reload wedge): beforeAssemblyReload calls ForceStop
++            // SYNCHRONOUSLY, so we must WAIT for the background loops to actually finish before
++            // returning. Merely nulling the task references (the old behaviour) left a live receive
++            // thread running when Unity froze the world to reload the domain — that orphaned thread is
++            // what hung the editor forever at "Reload Script Assemblies" at 100% CPU. With the token
++            // cancelled + socket aborted above, both loops exit in ~milliseconds; the bounded timeout
++            // is only a safety cap so a loop stuck mid main-thread marshal degrades to the old
++            // abandon-and-continue behaviour instead of blocking the reload indefinitely. Wait BEFORE
++            // disposing the CTS so the loops' cancellation checks stay valid while they unwind.
++            Task receive = _receiveTask, keepAlive = _keepAliveTask;
++            try
++            {
++                var pending = new List<Task>(2);
++                if (receive != null) pending.Add(receive);
++                if (keepAlive != null) pending.Add(keepAlive);
++                if (pending.Count > 0) Task.WaitAll(pending.ToArray(), TimeSpan.FromSeconds(2));
++            }
++            catch { /* AggregateException(TaskCanceled/faulted) from the unwinding loops is expected. */ }
++
+             try { _connectionCts?.Dispose(); } catch { }
+             _connectionCts = null;
+             _receiveTask = null;
+@@ -385,6 +408,19 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+                     string message = await ReceiveMessageAsync(token).ConfigureAwait(false);
+                     if (message == null)
+                     {
++                        // A null message means the socket is gone/closing (or, rarely, an empty frame).
++                        // NEVER tight-`continue` on a dead socket: ReceiveMessageAsync returns null
++                        // SYNCHRONOUSLY when _socket == null, so `continue` would spin this loop at 100%
++                        // CPU with no yield — and during a domain reload's synchronous ForceStop the socket
++                        // is torn down mid-loop, hitting exactly that race and wedging the reload. Just EXIT
++                        // the loop on any dead/closing socket. We deliberately do NOT trigger a reconnect
++                        // from here (that would race the teardown) — genuine reconnects are already handled
++                        // by the Close-frame branch in ReceiveMessageAsync and the WebSocketException/
++                        // Exception catches below. Only a live socket (rare empty frame) keeps looping.
++                        if (_socket == null || _socket.State != WebSocketState.Open)
++                        {
++                            break;
++                        }
+                         continue;
+                     }
+                     await HandleMessageAsync(message, token).ConfigureAwait(false);

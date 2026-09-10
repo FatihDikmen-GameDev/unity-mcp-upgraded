@@ -1,0 +1,206 @@
+diff --git a/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs b/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs
+index 8aaf2249..06fe2910 100644
+--- a/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs
++++ b/MCPForUnity/Editor/Services/Transport/Transports/WebSocketTransportClient.cs
+@@ -60,6 +60,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+         private TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
+         private string _apiKey;
+         private bool _disposed;
++        // Set for the duration of a synchronous ForceStop (domain-reload teardown). While set, NO new
++        // background loops or reconnects may start — otherwise a reconnect racing the teardown spawns an
++        // untracked receive thread that ForceStop never waits for, and that orphaned thread is what hangs
++        // the domain reload at 100% CPU. Volatile: read/written across the main + background threads.
++        private volatile bool _shuttingDown;
+ 
+         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
+         {
+@@ -175,26 +180,67 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+         /// </summary>
+         public void ForceStop()
+         {
+-            try { _lifecycleCts?.Cancel(); } catch { }
+-            try { _connectionCts?.Cancel(); } catch { }
+-
+-            if (_socket != null)
++            // Latch teardown FIRST so no reconnect/loop can start while we unwind (see _shuttingDown).
++            _shuttingDown = true;
++            McpLog.Info("[WebSocket] ForceStop: begin", false);
++            try
+             {
+-                try { _socket.Abort(); } catch { }
+-                try { _socket.Dispose(); } catch { }
++                // 1) Cancel the tokens the loops observe. This is what SHOULD unblock a receive parked in
++                //    ClientWebSocket.ReceiveAsync (its cancellation callback aborts the socket).
++                try { _lifecycleCts?.Cancel(); } catch { }
++                try { _connectionCts?.Cancel(); } catch { }
++
++                // 2) Abort AND Dispose the socket, nulling the field first so a looping thread that
++                //    re-enters ReceiveMessageAsync sees null and bails. Dispose closes the underlying
++                //    connection, forcing an in-progress native read to return even if (2021.3 Mono)
++                //    token cancellation alone doesn't interrupt it — this is the belt to the token's braces.
++                var sock = _socket;
+                 _socket = null;
+-            }
++                if (sock != null)
++                {
++                    try { sock.Abort(); } catch { }
++                    try { sock.Dispose(); } catch { }
++                }
++                McpLog.Info("[WebSocket] ForceStop: tokens cancelled + socket disposed", false);
++
++                // 3) Give the loops a SHORT, bounded chance to observe cancellation and exit. Kept short
++                //    on purpose: this runs on the main thread inside beforeAssemblyReload, and a
++                //    main-thread-marshalling continuation cannot run while we block here — a long wait
++                //    would risk the classic reload deadlock. With the break-on-dead-socket loop exit and
++                //    the socket disposal above, both loops complete in ~ms; the cap only smooths timing.
++                //    If a loop is genuinely wedged (native read that ignored both cancel + dispose), the
++                //    log line below reports done=false so we know the hang is below the managed layer.
++                Task receive = _receiveTask, keepAlive = _keepAliveTask;
++                try
++                {
++                    var pending = new List<Task>(2);
++                    if (receive != null) pending.Add(receive);
++                    if (keepAlive != null) pending.Add(keepAlive);
++                    if (pending.Count > 0)
++                    {
++                        bool done = Task.WaitAll(pending.ToArray(), TimeSpan.FromMilliseconds(800));
++                        McpLog.Info($"[WebSocket] ForceStop: loops exited within cap = {done}", false);
++                    }
++                }
++                catch { /* AggregateException(TaskCanceled/faulted) from the unwinding loops is expected. */ }
+ 
+-            try { _connectionCts?.Dispose(); } catch { }
+-            _connectionCts = null;
+-            _receiveTask = null;
+-            _keepAliveTask = null;
+-            Interlocked.Exchange(ref _isReconnectingFlag, 0);
+-            _isConnected = false;
+-            _state = TransportState.Disconnected(TransportDisplayName);
++                try { _connectionCts?.Dispose(); } catch { }
++                _connectionCts = null;
++                _receiveTask = null;
++                _keepAliveTask = null;
++                Interlocked.Exchange(ref _isReconnectingFlag, 0);
++                _isConnected = false;
++                _state = TransportState.Disconnected(TransportDisplayName);
+ 
+-            try { _lifecycleCts?.Dispose(); } catch { }
+-            _lifecycleCts = null;
++                try { _lifecycleCts?.Dispose(); } catch { }
++                _lifecycleCts = null;
++                McpLog.Info("[WebSocket] ForceStop: done", false);
++            }
++            finally
++            {
++                // Clear the latch so a later (manual or post-reload) reconnect can start loops again.
++                _shuttingDown = false;
++            }
+         }
+ 
+         public async Task<bool> VerifyAsync()
+@@ -367,6 +413,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+ 
+         private void StartBackgroundLoops(CancellationToken token)
+         {
++            // Never spawn loops while a synchronous teardown is in flight (domain-reload ForceStop) — a
++            // reconnect racing the teardown would otherwise create an untracked receive thread that hangs
++            // the reload.
++            if (_shuttingDown) return;
+             if ((_receiveTask != null && !_receiveTask.IsCompleted) || (_keepAliveTask != null && !_keepAliveTask.IsCompleted))
+             {
+                 return;
+@@ -385,6 +435,19 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+                     string message = await ReceiveMessageAsync(token).ConfigureAwait(false);
+                     if (message == null)
+                     {
++                        // A null message means the socket is gone/closing (or, rarely, an empty frame).
++                        // NEVER tight-`continue` on a dead socket: ReceiveMessageAsync returns null
++                        // SYNCHRONOUSLY when _socket == null, so `continue` would spin this loop at 100%
++                        // CPU with no yield — and during a domain reload's synchronous ForceStop the socket
++                        // is torn down mid-loop, hitting exactly that race and wedging the reload. Just EXIT
++                        // the loop on any dead/closing socket. We deliberately do NOT trigger a reconnect
++                        // from here (that would race the teardown) — genuine reconnects are already handled
++                        // by the Close-frame branch in ReceiveMessageAsync and the WebSocketException/
++                        // Exception catches below. Only a live socket (rare empty frame) keeps looping.
++                        if (_socket == null || _socket.State != WebSocketState.Open)
++                        {
++                            break;
++                        }
+                         continue;
+                     }
+                     await HandleMessageAsync(message, token).ConfigureAwait(false);
+@@ -395,12 +458,17 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+                 }
+                 catch (WebSocketException wse)
+                 {
++                    // Local patch 0002: during teardown exit SILENTLY — background-thread logging
++                    // while the main thread freezes the world for a reload wedges the editor.
++                    if (_shuttingDown || token.IsCancellationRequested) break;
+                     McpLog.Warn($"[WebSocket] Receive loop error: {wse.Message}");
+                     await HandleSocketClosureAsync(wse.Message).ConfigureAwait(false);
+                     break;
+                 }
+                 catch (Exception ex)
+                 {
++                    // Local patch 0002: see above — silent exit during teardown.
++                    if (_shuttingDown || token.IsCancellationRequested) break;
+                     McpLog.Warn($"[WebSocket] Unexpected receive error: {ex.Message}");
+                     await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
+                     break;
+@@ -661,6 +729,16 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+                 ["result"] = resultToken
+             };
+ 
++            // Local patch 0002: when the command itself triggered a domain reload (refresh/compile,
++            // play mode), ForceStop tears the socket down while we are still here. Nobody is left
++            // to answer — and touching the nulled/disposed socket throws an exception whose
++            // background-thread unwind (logging during the world-freeze) wedges the reload.
++            // Drop the response silently; the server recovers via its own timeout.
++            if (_shuttingDown || token.IsCancellationRequested || _socket == null)
++            {
++                return;
++            }
++
+             await SendJsonAsync(responsePayload, token).ConfigureAwait(false);
+         }
+ 
+@@ -683,6 +761,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+                 }
+                 catch (Exception ex)
+                 {
++                    // Local patch 0002: silent exit during teardown (see ReceiveLoopAsync).
++                    if (_shuttingDown || token.IsCancellationRequested) break;
+                     McpLog.Warn($"[WebSocket] Keep-alive failed: {ex.Message}");
+                     await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
+                     break;
+@@ -744,15 +824,26 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
+ 
+         private async Task HandleSocketClosureAsync(string reason)
+         {
+-            // Capture stack trace for debugging disconnection triggers
+-            var stackTrace = new System.Diagnostics.StackTrace(true);
+-            McpLog.Debug($"[WebSocket] HandleSocketClosureAsync called. Reason: {reason}\nStack trace:\n{stackTrace}");
++            // ORDER MATTERS (local patch 0002): the teardown guards must run BEFORE any logging
++            // or stack capture. This method is reached from background threads; during a domain
++            // reload the main thread is freezing the world, and a Debug.Log — let alone an
++            // expensive StackTrace(true) with file info — from a background thread at that moment
++            // is what wedges "Reload Script Assemblies" at 100% CPU (see LOCAL_PATCHES.md 0002).
+ 
+-            if (_lifecycleCts == null || _lifecycleCts.IsCancellationRequested)
++            // During a synchronous teardown, never kick off a reconnect (it would race ForceStop and
++            // spawn an untracked receive thread that wedges the domain reload).
++            if (_shuttingDown) return;
++
++            var lifecycle = _lifecycleCts; // local copy: ForceStop nulls the field concurrently
++            if (lifecycle == null || lifecycle.IsCancellationRequested)
+             {
+                 return;
+             }
+ 
++            // Capture stack trace for debugging disconnection triggers (safe here: not tearing down)
++            var stackTrace = new System.Diagnostics.StackTrace(true);
++            McpLog.Debug($"[WebSocket] HandleSocketClosureAsync called. Reason: {reason}\nStack trace:\n{stackTrace}");
++
+             if (Interlocked.CompareExchange(ref _isReconnectingFlag, 1, 0) != 0)
+             {
+                 return;

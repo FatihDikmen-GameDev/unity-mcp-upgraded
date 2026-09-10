@@ -145,11 +145,8 @@ namespace MCPForUnity.Editor.Services.Transport
 
         /// <summary>
         /// Synchronous teardown for shutdown/reload hooks where async awaits are not possible.
-        /// Local patch 0003: returns true when the client had live work at entry (a connection,
-        /// a loop, or an in-flight reconnect) — callers use this to decide whether to schedule a
-        /// resume; "IsRunning" alone misses a client that is mid-reconnect.
         /// </summary>
-        public bool ForceStop(TransportMode mode)
+        public void ForceStop(TransportMode mode)
         {
             IMcpTransportClient client = GetClient(mode);
             string transportName = client?.TransportName ?? mode.ToString().ToLowerInvariant();
@@ -157,19 +154,17 @@ namespace MCPForUnity.Editor.Services.Transport
             if (client == null)
             {
                 UpdateState(mode, TransportState.Disconnected(transportName));
-                return false;
+                return;
             }
 
-            bool hadLiveWork = false;
             try
             {
                 if (client is WebSocketTransportClient wsClient)
                 {
-                    hadLiveWork = wsClient.ForceStop();
+                    wsClient.ForceStop();
                 }
                 else
                 {
-                    hadLiveWork = client.State?.IsConnected == true;
                     client.StopAsync().GetAwaiter().GetResult();
                 }
             }
@@ -181,7 +176,6 @@ namespace MCPForUnity.Editor.Services.Transport
             {
                 UpdateState(mode, TransportState.Disconnected(transportName));
             }
-            return hadLiveWork;
         }
 
         /// <summary>

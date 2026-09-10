@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **⚠️ This is a FORK with local patches not in the CoplayDev upstream.** Before merging/updating to a
+> new upstream version, read [`LOCAL_PATCHES.md`](LOCAL_PATCHES.md) — it lists every local fix with
+> per-patch **keep-or-drop** instructions. Never silently discard a local patch whose bug is still
+> present in the incoming upstream version.
+
 ## What This Project Is
 
 **MCP for Unity** is a bridge that lets AI assistants (Claude, Cursor, Windsurf, etc.) control the Unity Editor through the Model Context Protocol (MCP). It enables AI-driven game development workflows - creating GameObjects, editing scripts, managing assets, running tests, and more.
